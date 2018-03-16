@@ -1,13 +1,10 @@
 'use strict';
 
-const _             = require('lodash');
 const fs            = require('fs');
 const ejs           = require('ejs');
 const timestamp     = require('unix-timestamp');
-const batchflow     = require('batchflow');
 const internalNginx = require('./nginx');
 const logger        = require('../logger');
-const db            = require('../db');
 const utils         = require('../lib/utils');
 const error         = require('../lib/error');
 
@@ -15,7 +12,7 @@ timestamp.round = true;
 
 const internalSsl = {
 
-    interval_timeout:    60 * 1000,
+    interval_timeout:    1000 * 60 * 60 * 6, // 6 hours
     interval:            null,
     interval_processing: false,
 
@@ -28,42 +25,21 @@ const internalSsl = {
      */
     processExpiringHosts: () => {
         if (!internalSsl.interval_processing) {
-            let hosts = db.hosts.find();
+            logger.info('Renewing SSL certs close to expiry...');
+            return utils.exec('/usr/bin/certbot renew --webroot=/config/letsencrypt-acme-challenge')
+                .then(result => {
+                    logger.info(result);
+                    internalSsl.interval_processing = false;
 
-            if (hosts && hosts.length) {
-                internalSsl.interval_processing = true;
-
-                batchflow(hosts).sequential()
-                    .each((i, host, next) => {
-                        if ((typeof host.is_deleted === 'undefined' || !host.is_deleted) && host.ssl && typeof host.ssl_expires !== 'undefined' && !internalSsl.hasValidSslCerts(host)) {
-                            // This host is due to expire in 1 day, time to renew
-                            logger.info('Host ' + host.hostname + ' is due for SSL renewal');
-
-                            internalSsl.renewSsl(host)
-                                .then(() => {
-                                    // Certificate was requested ok, update the timestamp on the host
-                                    db.hosts.update({_id: host._id}, {ssl_expires: timestamp.now('+90d')}, {
-                                        multi:  false,
-                                        upsert: false
-                                    });
-                                })
-                                .then(next)
-                                .catch(err => {
-                                    logger.error(err);
-                                    next(err);
-                                });
-                        } else {
-                            next();
-                        }
-                    })
-                    .error(err => {
-                        logger.error(err);
-                        internalSsl.interval_processing = false;
-                    })
-                    .end((/*results*/) => {
-                        internalSsl.interval_processing = false;
-                    });
-            }
+                    return internalNginx.reload()
+                        .then(() => {
+                            return result;
+                        });
+                })
+                .catch(err => {
+                    logger.error(err);
+                    internalSsl.interval_processing = false;
+                });
         }
     },
 
@@ -73,8 +49,7 @@ const internalSsl = {
      */
     hasValidSslCerts: host => {
         return fs.existsSync('/etc/letsencrypt/live/' + host.hostname + '/fullchain.pem') &&
-            fs.existsSync('/etc/letsencrypt/live/' + host.hostname + '/privkey.pem') &&
-            host.ssl_expires > timestamp.now('+1d');
+            fs.existsSync('/etc/letsencrypt/live/' + host.hostname + '/privkey.pem');
     },
 
     /**
@@ -84,7 +59,7 @@ const internalSsl = {
     requestSsl: host => {
         logger.info('Requesting SSL certificates for ' + host.hostname);
 
-        return utils.exec('/usr/bin/letsencrypt certonly --agree-tos --email "' + host.letsencrypt_email + '" -n -a webroot --webroot-path=' + host.root_path + ' -d "' + host.hostname + '"')
+        return utils.exec('/usr/bin/letsencrypt certonly --agree-tos --email "' + host.letsencrypt_email + '" -n -a webroot --webroot-path=/config/letsencrypt-acme-challenge -d "' + host.hostname + '"')
             .then(result => {
                 logger.info(result);
                 return result;
@@ -98,7 +73,7 @@ const internalSsl = {
     renewSsl: host => {
         logger.info('Renewing SSL certificates for ' + host.hostname);
 
-        return utils.exec('/usr/bin/letsencrypt renew --force-renewal --disable-hook-validation --cert-name "' + host.hostname + '"')
+        return utils.exec('/usr/bin/certbot renew --force-renewal --disable-hook-validation --webroot-path=/config/letsencrypt-acme-challenge --cert-name "' + host.hostname + '"')
             .then(result => {
                 logger.info(result);
                 return result;
@@ -112,7 +87,7 @@ const internalSsl = {
     deleteCerts: host => {
         logger.info('Deleting SSL certificates for ' + host.hostname);
 
-        return utils.exec('/usr/bin/letsencrypt delete -n --cert-name "' + host.hostname + '"')
+        return utils.exec('/usr/bin/certbot delete -n --cert-name "' + host.hostname + '"')
             .then(result => {
                 logger.info(result);
             })
@@ -130,20 +105,17 @@ const internalSsl = {
         let filename      = internalNginx.getConfigName(host);
         let template_data = host;
 
-        template_data.root_path = '/tmp/' + host.hostname;
+        return new Promise((resolve, reject) => {
+            try {
+                template        = fs.readFileSync(__dirname + '/../templates/letsencrypt.conf.ejs', {encoding: 'utf8'});
+                let config_text = ejs.render(template, template_data);
+                fs.writeFileSync(filename, config_text, {encoding: 'utf8'});
 
-        return utils.exec('mkdir -p ' + template_data.root_path)
-            .then(() => {
-                try {
-                    template        = fs.readFileSync(__dirname + '/../templates/letsencrypt.conf.ejs', {encoding: 'utf8'});
-                    let config_text = ejs.render(template, template_data);
-                    fs.writeFileSync(filename, config_text, {encoding: 'utf8'});
-
-                    return template_data;
-                } catch (err) {
-                    throw new error.ConfigurationError(err.message);
-                }
-            });
+                resolve(template_data);
+            } catch (err) {
+                reject(new error.ConfigurationError(err.message));
+            }
+        });
     },
 
     /**
@@ -157,10 +129,6 @@ const internalSsl = {
                     .then(() => {
                         return internalSsl.requestSsl(data);
                     });
-            })
-            .then(() => {
-                // Certificate was requested ok, update the timestamp on the host
-                db.hosts.update({_id: host._id}, {ssl_expires: timestamp.now('+90d')}, {multi: false, upsert: false});
             });
     }
 };
